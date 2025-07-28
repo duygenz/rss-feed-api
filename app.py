@@ -6,76 +6,105 @@ from flask_cors import CORS
 
 # Khởi tạo ứng dụng Flask
 app = Flask(__name__)
-
-# Kích hoạt CORS cho tất cả các domain trên tất cả các route
-# Điều này cho phép các ứng dụng web khác có thể gọi API của bạn
+# Bật CORS cho tất cả các domain. Để an toàn hơn trong production,
+# bạn nên chỉ định rõ domain của frontend, ví dụ: CORS(app, origins="https://your-frontend-app.com")
 CORS(app)
 
-# Danh sách các URL của RSS feed
+# Danh sách các RSS feed từ Investing.com
 RSS_FEEDS = {
     'fundamental': 'https://vn.investing.com/rss/market_overview_Fundamental.rss',
     'technical': 'https://vn.investing.com/rss/market_overview_Technical.rss',
     'opinion': 'https://vn.investing.com/rss/market_overview_Opinion.rss',
-    'ideas': 'https://vn.investing.com/rss/market_overview_investing_ideas.rss'
+    'ideas': 'https://vn.investing.com/rss/market_overview_investing_ideas.rss',
 }
 
 def scrape_article_content(url):
     """
-    Hàm này thực hiện scraping để lấy nội dung chính của bài viết từ URL.
-    Lưu ý: Cấu trúc của mỗi trang web là khác nhau, bạn có thể cần điều chỉnh
-    các bộ chọn (selector) của BeautifulSoup cho phù hợp.
+    Hàm này nhận một URL của bài viết, tải nội dung HTML và
+    trích xuất nội dung chính của bài viết bằng BeautifulSoup.
+    Lưu ý: Cấu trúc HTML của mỗi trang web là khác nhau,
+    selector có thể cần phải được điều chỉnh cho phù hợp.
     """
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
         response.raise_for_status()  # Ném lỗi nếu request không thành công
+
         soup = BeautifulSoup(response.content, 'html.parser')
 
-        # Ví dụ về cách tìm nội dung bài viết.
-        # Bạn cần "Inspect" (Kiểm tra) trang web đích để tìm đúng selector.
-        # Ví dụ này giả định nội dung nằm trong một thẻ <article>
-        article_body = soup.find('article')
+        # Selector này dùng để tìm nội dung chính của bài viết trên Investing.com
+        # Đây là phần khó nhất và có thể cần thay đổi nếu trang web cập nhật layout
+        article_body = soup.find('div', class_='article_body')
+
         if article_body:
-            return article_body.get_text(strip=True)
-        return "Không thể lấy được nội dung chi tiết."
-    except requests.exceptions.RequestException as e:
-        return f"Lỗi khi truy cập URL: {e}"
+            # Lấy một vài đoạn văn bản đầu tiên làm tóm tắt
+            paragraphs = article_body.find_all('p')
+            summary = ' '.join(p.get_text() for p in paragraphs[:3]) # Lấy 3 đoạn đầu
+            return summary
+        return "Không thể trích xuất nội dung."
+    except requests.RequestException as e:
+        return f"Lỗi khi tải trang: {e}"
     except Exception as e:
-        return f"Lỗi không xác định khi scraping: {e}"
+        return f"Lỗi khi scraping: {e}"
+
+def parse_rss(feed_url, with_content=False):
+    """
+    Phân tích một RSS feed và trả về danh sách các bài viết.
+    Nếu with_content=True, hàm sẽ thực hiện scraping để lấy nội dung tóm tắt.
+    """
+    feed = feedparser.parse(feed_url)
+    articles = []
+    for entry in feed.entries:
+        article = {
+            'title': entry.title,
+            'link': entry.link,
+            'published': entry.published,
+            'summary': entry.summary,
+            'scraped_content': None # Khởi tạo giá trị
+        }
+        # Nếu có yêu cầu scraping, gọi hàm scrape_article_content
+        if with_content:
+            article['scraped_content'] = scrape_article_content(entry.link)
+        articles.append(article)
+    return articles
+
+# --- Định nghĩa các API Endpoints ---
 
 @app.route('/')
 def index():
-    """Endpoint chính, cung cấp thông tin về các API có sẵn."""
+    """Endpoint chào mừng và hướng dẫn."""
     return jsonify({
-        "message": "Chào mừng đến với API tổng hợp tin tức từ Investing.com",
-        "available_feeds": list(RSS_FEEDS.keys())
+        "message": "Chào mừng đến với API RSS Investing.com",
+        "endpoints": {
+            "/api/fundamental": "Phân tích cơ bản",
+            "/api/technical": "Phân tích kỹ thuật",
+            "/api/opinion": "Bài viết quan điểm",
+            "/api/ideas": "Ý tưởng đầu tư",
+        },
+        "note": "Thêm `?scrape=true` vào cuối URL để lấy thêm nội dung tóm tắt từ trang gốc (chậm hơn)."
     })
 
-@app.route('/feed/<string:feed_name>')
-def get_feed(feed_name):
+@app.route('/api/<category>')
+def get_feed(category):
     """
-    Endpoint động để lấy dữ liệu từ một RSS feed cụ thể.
-    Ví dụ: /feed/technical
+    Endpoint chung để lấy tin tức theo danh mục.
+    Ví dụ: /api/fundamental
     """
-    if feed_name not in RSS_FEEDS:
-        return jsonify({"error": "Không tìm thấy feed này."}), 404
+    if category not in RSS_FEEDS:
+        return jsonify({"error": "Danh mục không hợp lệ."}), 404
 
-    # Lấy dữ liệu từ URL của RSS feed
-    feed = feedparser.parse(RSS_FEEDS[feed_name])
-    posts = []
+    # Kiểm tra query parameter 'scrape'
+    from flask import request
+    should_scrape = request.args.get('scrape', 'false').lower() == 'true'
 
-    # Lặp qua từng mục tin trong feed
-    for entry in feed.entries:
-        posts.append({
-            'title': entry.title,
-            'link': entry.link,
-            'published': entry.published if hasattr(entry, 'published') else 'Không có ngày xuất bản',
-            'summary': entry.summary,
-            # Bật dòng dưới đây nếu bạn muốn scraping nội dung của từng bài viết
-            # 'content': scrape_article_content(entry.link)
-        })
-
-    return jsonify(posts)
+    try:
+        feed_url = RSS_FEEDS[category]
+        articles = parse_rss(feed_url, with_content=should_scrape)
+        return jsonify(articles)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
-    # Chạy ứng dụng ở chế độ debug khi được thực thi trực tiếp
-    app.run(debug=True)
+    # Chạy app ở chế độ debug khi phát triển ở local
+    # Gunicorn sẽ được dùng trong production
+    app.run(debug=True, port=5001)
+
