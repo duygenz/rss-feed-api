@@ -1,110 +1,130 @@
 import feedparser
-import requests
+import nltk
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from bs4 import BeautifulSoup
-from flask import Flask, jsonify
-from flask_cors import CORS
+import requests
 
-# Khởi tạo ứng dụng Flask
-app = Flask(__name__)
-# Bật CORS cho tất cả các domain. Để an toàn hơn trong production,
-# bạn nên chỉ định rõ domain của frontend, ví dụ: CORS(app, origins="https://your-frontend-app.com")
-CORS(app)
+# Tải xuống tài nguyên cần thiết cho NLTK để tách câu
+# Thư mục 'punkt' sẽ được tạo trong dự án của bạn
+try:
+    nltk.data.find('tokenizers/punkt')
+except nltk.downloader.DownloadError:
+    nltk.download('punkt')
 
-# Danh sách các RSS feed từ Investing.com
+# --- Khởi tạo ứng dụng FastAPI ---
+app = FastAPI(
+    title="Vietnam Market Overview API",
+    description="API để lấy và phân tích thông tin thị trường từ các nguồn RSS của Investing.com.",
+    version="1.0.0",
+)
+
+# --- Cấu hình CORS ---
+# Cho phép tất cả các nguồn gốc để linh hoạt tối đa khi phát triển.
+# Trong môi trường sản xuất, bạn nên giới hạn danh sách này.
+origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # Cho phép tất cả các phương thức (GET, POST, etc.)
+    allow_headers=["*"],  # Cho phép tất cả các tiêu đề
+)
+
+
+# --- URL của các nguồn cấp RSS ---
 RSS_FEEDS = {
-    'fundamental': 'https://vn.investing.com/rss/market_overview_Fundamental.rss',
-    'technical': 'https://vn.investing.com/rss/market_overview_Technical.rss',
-    'opinion': 'https://vn.investing.com/rss/market_overview_Opinion.rss',
-    'ideas': 'https://vn.investing.com/rss/market_overview_investing_ideas.rss',
+    "fundamental": "https://vn.investing.com/rss/market_overview_Fundamental.rss",
+    "technical": "https://vn.investing.com/rss/market_overview_Technical.rss",
+    "opinion": "https://vn.investing.com/rss/market_overview_Opinion.rss",
+    "ideas": "https://vn.investing.com/rss/market_overview_investing_ideas.rss",
 }
 
-def scrape_article_content(url):
+# --- Chức năng xử lý văn bản ---
+def get_full_content(url: str) -> str:
     """
-    Hàm này nhận một URL của bài viết, tải nội dung HTML và
-    trích xuất nội dung chính của bài viết bằng BeautifulSoup.
-    Lưu ý: Cấu trúc HTML của mỗi trang web là khác nhau,
-    selector có thể cần phải được điều chỉnh cho phù hợp.
+    Truy cập URL của bài viết và trích xuất toàn bộ nội dung văn bản.
     """
     try:
-        response = requests.get(url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
-        response.raise_for_status()  # Ném lỗi nếu request không thành công
-
+        response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'})
+        response.raise_for_status()
         soup = BeautifulSoup(response.content, 'html.parser')
-
-        # Selector này dùng để tìm nội dung chính của bài viết trên Investing.com
-        # Đây là phần khó nhất và có thể cần thay đổi nếu trang web cập nhật layout
+        
+        # Tìm thẻ chứa nội dung chính (thường là 'article' hoặc một div có class cụ thể)
+        # Selector này có thể cần điều chỉnh tùy theo cấu trúc của trang web
         article_body = soup.find('div', class_='article_body')
-
         if article_body:
-            # Lấy một vài đoạn văn bản đầu tiên làm tóm tắt
             paragraphs = article_body.find_all('p')
-            summary = ' '.join(p.get_text() for p in paragraphs[:3]) # Lấy 3 đoạn đầu
-            return summary
-        return "Không thể trích xuất nội dung."
+            return "\n".join([p.get_text() for p in paragraphs])
+        return ""
     except requests.RequestException as e:
-        return f"Lỗi khi tải trang: {e}"
-    except Exception as e:
-        return f"Lỗi khi scraping: {e}"
+        print(f"Lỗi khi lấy nội dung từ {url}: {e}")
+        return ""
 
-def parse_rss(feed_url, with_content=False):
+def chunk_text(text: str, chunk_size: int = 5) -> list[str]:
     """
-    Phân tích một RSS feed và trả về danh sách các bài viết.
-    Nếu with_content=True, hàm sẽ thực hiện scraping để lấy nội dung tóm tắt.
+    Chia văn bản đầy đủ thành các đoạn nhỏ (chunks) gồm một số câu nhất định.
     """
-    feed = feedparser.parse(feed_url)
-    articles = []
-    for entry in feed.entries:
-        article = {
-            'title': entry.title,
-            'link': entry.link,
-            'published': entry.published,
-            'summary': entry.summary,
-            'scraped_content': None # Khởi tạo giá trị
+    if not text:
+        return []
+    sentences = nltk.sent_tokenize(text)
+    chunks = [" ".join(sentences[i:i + chunk_size]) for i in range(0, len(sentences), chunk_size)]
+    return chunks
+
+# --- Các điểm cuối (Endpoints) của API ---
+@app.get("/", summary="Endpoint chào mừng", description="Hiển thị thông điệp chào mừng cho API.")
+async def read_root():
+    """
+    Endpoint gốc trả về một thông điệp chào mừng đơn giản.
+    """
+    return {"message": "Chào mừng bạn đến với Vietnam Market Overview API!"}
+
+
+@app.get("/rss/{feed_name}", summary="Lấy dữ liệu từ một nguồn RSS cụ thể")
+async def get_rss_feed(feed_name: str, include_full_content: bool = False, chunk_content: bool = False):
+    """
+    Lấy các mục từ một nguồn cấp RSS được chỉ định.
+
+    - **feed_name**: Tên của nguồn cấp (fundamental, technical, opinion, ideas).
+    - **include_full_content**: Nếu `True`, sẽ cố gắng lấy toàn bộ nội dung bài viết.
+    - **chunk_content**: Nếu `True` (và `include_full_content` cũng là `True`), nội dung đầy đủ sẽ được chia thành các đoạn.
+    """
+    if feed_name not in RSS_FEEDS:
+        raise HTTPException(status_code=404, detail="Không tìm thấy nguồn cấp RSS.")
+
+    feed_url = RSS_FEEDS[feed_name]
+    parsed_feed = feedparser.parse(feed_url)
+
+    if parsed_feed.bozo:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Lỗi khi phân tích cú pháp RSS: {parsed_feed.bozo_exception}"
+        )
+
+    entries = []
+    for entry in parsed_feed.entries:
+        entry_data = {
+            "title": entry.title,
+            "link": entry.link,
+            "published": entry.get("published", "N/A"),
+            "summary": entry.summary,
+            "full_content": None,
+            "content_chunks": None
         }
-        # Nếu có yêu cầu scraping, gọi hàm scrape_article_content
-        if with_content:
-            article['scraped_content'] = scrape_article_content(entry.link)
-        articles.append(article)
-    return articles
+        
+        if include_full_content:
+            full_content = get_full_content(entry.link)
+            entry_data["full_content"] = full_content
+            if chunk_content and full_content:
+                entry_data["content_chunks"] = chunk_text(full_content)
 
-# --- Định nghĩa các API Endpoints ---
+        entries.append(entry_data)
+        
+    return {"feed_name": feed_name, "entries": entries}
 
-@app.route('/')
-def index():
-    """Endpoint chào mừng và hướng dẫn."""
-    return jsonify({
-        "message": "Chào mừng đến với API RSS Investing.com",
-        "endpoints": {
-            "/api/fundamental": "Phân tích cơ bản",
-            "/api/technical": "Phân tích kỹ thuật",
-            "/api/opinion": "Bài viết quan điểm",
-            "/api/ideas": "Ý tưởng đầu tư",
-        },
-        "note": "Thêm `?scrape=true` vào cuối URL để lấy thêm nội dung tóm tắt từ trang gốc (chậm hơn)."
-    })
-
-@app.route('/api/<category>')
-def get_feed(category):
-    """
-    Endpoint chung để lấy tin tức theo danh mục.
-    Ví dụ: /api/fundamental
-    """
-    if category not in RSS_FEEDS:
-        return jsonify({"error": "Danh mục không hợp lệ."}), 404
-
-    # Kiểm tra query parameter 'scrape'
-    from flask import request
-    should_scrape = request.args.get('scrape', 'false').lower() == 'true'
-
-    try:
-        feed_url = RSS_FEEDS[category]
-        articles = parse_rss(feed_url, with_content=should_scrape)
-        return jsonify(articles)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == '__main__':
-    # Chạy app ở chế độ debug khi phát triển ở local
-    # Gunicorn sẽ được dùng trong production
-    app.run(debug=True, port=5001)
-
+# --- Lệnh để chạy máy chủ (sử dụng khi phát triển cục bộ) ---
+if __name__ == "__main__":
+    # Chạy máy chủ Uvicorn trên cổng 8000
+    uvicorn.run(app, host="0.0.0.0", port=8000)
