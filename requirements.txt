@@ -1,6 +1,6 @@
-Flask
-requests
-feedparser
-beautifulsoup4
-gunicorn
-flask-cors
+Flask==3.0.3
+Flask-Cors==4.0.1
+feedparser==6.0.11
+requests==2.32.3
+beautifulsoup4==4.12.3
+gunicorn==22.0.0
